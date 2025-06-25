@@ -11,6 +11,8 @@
     "hardhat": "^2.19.1"
   },
   "dependencies": {
+    "@chainlink/contracts": "^1.4.0",
+    "@chainlink/contracts-ccip": "^1.6.0",
     "@thirdweb-dev/contracts": "^3.8.0",
     "zksync-ethers": "^5.7.0"
   }

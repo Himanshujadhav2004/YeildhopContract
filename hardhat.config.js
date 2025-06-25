@@ -13,6 +13,7 @@ module.exports = {
       },
     },
   },
+  
   networks: {
     zkSyncSepoliaTestnet: {
       url: "https://sepolia.era.zksync.dev",
@@ -44,6 +45,10 @@ module.exports = {
         enabled: true,
         runs: 200,
       },
+      
     },
+    
   },
+  
+  
 };
