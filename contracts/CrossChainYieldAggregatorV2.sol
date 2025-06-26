@@ -25,6 +25,13 @@ contract CrossChainYieldAggregatorV2 is AutomationCompatibleInterface, CCIPRecei
     error InvalidReceiverAddress();
     error InvalidMigrationAmount();
     error MigrationInProgress();
+    error NoLinkBalance(uint256 currentBalance);
+    error InsufficientAssetBalance(uint256 currentBalance, uint256 required);
+    error ApprovalFailed(string reason);
+    error CCIPSendFailed(string reason);
+    error UpkeepConditionsNotMet(string reason);
+    error RouterNotConfigured();
+    error AssetNotConfigured();
 
     // State variables
     uint256 public lastRebalanced;
@@ -178,10 +185,70 @@ contract CrossChainYieldAggregatorV2 is AutomationCompatibleInterface, CCIPRecei
      * @notice Chainlink Automation performUpkeep
      */
     function performUpkeep(bytes calldata) external override {
-        if ((block.timestamp - lastRebalanced) > rebalanceInterval && 
-            remoteAPY > apy && 
-            !migrationInProgress) {
-            _migrateFundsToRemote();
+        // Check if router is configured
+        if (address(router) == address(0)) revert RouterNotConfigured();
+        
+        // Check if asset is configured
+        if (address(asset) == address(0)) revert AssetNotConfigured();
+        
+        // Check time condition
+        bool timeCondition = (block.timestamp - lastRebalanced) > rebalanceInterval;
+        if (!timeCondition) {
+            revert UpkeepConditionsNotMet("Time condition not met");
+        }
+        
+        // Check APY condition
+        bool apyCondition = remoteAPY > apy;
+        if (!apyCondition) {
+            revert UpkeepConditionsNotMet("Remote APY not higher than local APY");
+        }
+        
+        // Check migration condition
+        if (migrationInProgress) {
+            revert UpkeepConditionsNotMet("Migration already in progress");
+        }
+        
+        // Check if there are funds to migrate
+        if (totalDeposited == 0) {
+            revert UpkeepConditionsNotMet("No funds deposited to migrate");
+        }
+        
+        // Check LINK balance for fees
+        uint256 linkBalance = IERC20(feeToken).balanceOf(address(this));
+        if (linkBalance == 0) {
+            revert NoLinkBalance(linkBalance);
+        }
+        
+        // Check asset balance
+        uint256 contractBalance = asset.balanceOf(address(this));
+        if (contractBalance < totalDeposited) {
+            revert InsufficientAssetBalance(contractBalance, totalDeposited);
+        }
+        
+        // All conditions met, proceed with migration
+        _migrateFundsToRemote();
+    }
+
+    /**
+     * @dev Internal: Safe approval function with detailed error handling
+     */
+    function _safeApproveAsset(address spender, uint256 amount) internal {
+        // First reset to 0
+        try asset.approve(spender, 0) {
+            emit ApprovalSet(spender, 0);
+        } catch Error(string memory reason) {
+            revert ApprovalFailed(string(abi.encodePacked("Reset approval failed: ", reason)));
+        } catch {
+            revert ApprovalFailed("Reset approval failed with unknown error");
+        }
+        
+        // Then approve the new amount
+        try asset.approve(spender, amount) {
+            emit ApprovalSet(spender, amount);
+        } catch Error(string memory reason) {
+            revert ApprovalFailed(string(abi.encodePacked("Approval failed: ", reason)));
+        } catch {
+            revert ApprovalFailed("Approval failed with unknown error");
         }
     }
 
@@ -191,35 +258,58 @@ contract CrossChainYieldAggregatorV2 is AutomationCompatibleInterface, CCIPRecei
     function _migrateFundsToRemote() internal {
         uint256 amountToMigrate = totalDeposited;
         if (amountToMigrate == 0) revert InvalidMigrationAmount();
+        
         uint256 contractBalance = asset.balanceOf(address(this));
-        require(contractBalance >= amountToMigrate, "Not enough asset balance for migration");
+        if (contractBalance < amountToMigrate) {
+            revert InsufficientAssetBalance(contractBalance, amountToMigrate);
+        }
+        
+        // Double-check LINK balance for fees
+        uint256 linkBalance = IERC20(feeToken).balanceOf(address(this));
+        if (linkBalance == 0) {
+            revert NoLinkBalance(linkBalance);
+        }
+        
         migrationInProgress = true;
         emit MigrationStarted(amountToMigrate, contractBalance, block.timestamp);
-        // SafeERC20 for compatibility
-        asset.safeApprove(address(router), 0);
-        asset.safeApprove(address(router), amountToMigrate);
-        emit ApprovalSet(address(router), amountToMigrate);
+        
+        // Step 1: Safe approval using our helper function
+        _safeApproveAsset(address(router), amountToMigrate);
+        
+        // Step 2: Prepare CCIP message
         Client.EVMTokenAmount[] memory tokenAmounts = new Client.EVMTokenAmount[](1);
         tokenAmounts[0] = Client.EVMTokenAmount({
             token: address(asset),
             amount: amountToMigrate
         });
+        
         Client.EVM2AnyMessage memory message = Client.EVM2AnyMessage({
             receiver: abi.encode(destinationAggregator),
             data: abi.encode(yieldReceiver),
             tokenAmounts: tokenAmounts,
             extraArgs: Client._argsToBytes(
                 Client.GenericExtraArgsV2({
-                    gasLimit: 200_000,
+                    gasLimit: 1_000_000,
                     allowOutOfOrderExecution: true
                 })
             ),
             feeToken: feeToken
         });
-        router.ccipSend(destinationChainSelector, message);
-        emit MigrationSent(destinationChainSelector, destinationAggregator, amountToMigrate, block.timestamp);
-        lastRebalanced = block.timestamp;
-        emit FundsMigrated(amountToMigrate, block.timestamp);
+        
+        // Step 3: Send CCIP message
+        try router.ccipSend(destinationChainSelector, message) {
+            emit MigrationSent(destinationChainSelector, destinationAggregator, amountToMigrate, block.timestamp);
+            lastRebalanced = block.timestamp;
+            emit FundsMigrated(amountToMigrate, block.timestamp);
+        } catch Error(string memory reason) {
+            // Reset migration state on failure
+            migrationInProgress = false;
+            revert CCIPSendFailed(string(abi.encodePacked("CCIP Send failed: ", reason)));
+        } catch {
+            // Reset migration state on failure
+            migrationInProgress = false;
+            revert CCIPSendFailed("CCIP Send failed with unknown error");
+        }
     }
 
     /**
@@ -336,6 +426,90 @@ contract CrossChainYieldAggregatorV2 is AutomationCompatibleInterface, CCIPRecei
     }
     function getMigrationStatus() external view returns (bool) {
         return migrationInProgress;
+    }
+    // ========== Debug Functions ========== //
+    function getDebugInfoBasic() external view returns (
+        uint256 _totalDeposited,
+        uint256 _contractAssetBalance,
+        uint256 _linkBalance,
+        bool _migrationInProgress,
+        uint256 _lastRebalanced,
+        uint256 _rebalanceInterval,
+        uint256 _apy,
+        uint256 _remoteAPY
+    ) {
+        return (
+            totalDeposited,
+            asset.balanceOf(address(this)),
+            IERC20(feeToken).balanceOf(address(this)),
+            migrationInProgress,
+            lastRebalanced,
+            rebalanceInterval,
+            apy,
+            remoteAPY
+        );
+    }
+    
+    function getDebugInfoAddresses() external view returns (
+        address _asset,
+        address _router,
+        address _feeToken,
+        uint64 _destinationChainSelector,
+        address _destinationAggregator
+    ) {
+        return (
+            address(asset),
+            address(router),
+            feeToken,
+            destinationChainSelector,
+            destinationAggregator
+        );
+    }
+    
+    function getDebugInfoConditions() external view returns (
+        bool _timeCondition,
+        bool _apyCondition,
+        bool _migrationCondition,
+        bool _fundsCondition,
+        bool _linkCondition,
+        bool _balanceCondition
+    ) {
+        uint256 currentTime = block.timestamp;
+        
+        return (
+            (currentTime - lastRebalanced) > rebalanceInterval,
+            remoteAPY > apy,
+            !migrationInProgress,
+            totalDeposited > 0,
+            IERC20(feeToken).balanceOf(address(this)) > 0,
+            asset.balanceOf(address(this)) >= totalDeposited
+        );
+    }
+    
+    function getUpkeepStatus() external view returns (string memory) {
+        uint256 currentTime = block.timestamp;
+        
+        // Check conditions in order
+        if ((currentTime - lastRebalanced) <= rebalanceInterval) {
+            return "Time condition not met";
+        }
+        if (remoteAPY <= apy) {
+            return "Remote APY not higher than local APY";
+        }
+        if (migrationInProgress) {
+            return "Migration already in progress";
+        }
+        if (totalDeposited == 0) {
+            return "No funds deposited to migrate";
+        }
+        if (IERC20(feeToken).balanceOf(address(this)) == 0) {
+            return "No LINK balance for fees";
+        }
+        if (asset.balanceOf(address(this)) < totalDeposited) {
+            return "Insufficient asset balance";
+        }
+        
+        return "All conditions met - upkeep should work";
     }
     // Accept native tokens for fee payments
     receive() external payable {}
